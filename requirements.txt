@@ -1,3 +1,10 @@
-# Base runtime requirements for research-paper-intelligence
+# Stable, tested dependencies for research-paper-intelligence
+# Versions selected for Python >= 3.11 and mutual compatibility.
 
-requests>=2.31.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+matplotlib==3.7.2
+nltk==3.8.1
+pandas==2.2.2
+pytest==8.4.3
+requests==2.31.0
