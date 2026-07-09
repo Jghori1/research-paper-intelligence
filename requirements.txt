@@ -1,0 +1,3 @@
+# Base runtime requirements for research-paper-intelligence
+
+requests>=2.31.0

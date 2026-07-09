@@ -1,0 +1,2 @@
+# Placeholder to ensure the data/raw directory is tracked by Git
+# Raw, unprocessed data should be stored here (do not commit large files).
