@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment
+.env
+.venv/
+venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Editor directories
+.vscode/
+.idea/
+
+# Test, coverage
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Local artifacts
+.run.log
+
+# Data and generated artifacts (do not commit large datasets or generated files)
+data/raw/*
+data/processed/*
+graphs/*
+reports/*
+logs/*
+
+# Allow .gitkeep files
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!graphs/.gitkeep
+!reports/.gitkeep
+!logs/.gitkeep
