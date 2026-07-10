@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>arXiv recent submissions</title>
+  <entry>
+    <id>http://arxiv.org/abs/1234.5678v1</id>
+    <updated>2026-01-01T12:00:00Z</updated>
+    <published>2026-01-01T12:00:00Z</published>
+    <title>Test Paper One</title>
+    <summary>This is an abstract for Test Paper One. It mentions ImageNet and uses accuracy as a metric.</summary>
+    <author><name>Alice Smith</name></author>
+    <author><name>Bob Jones</name></author>
+    <link rel="alternate" href="http://arxiv.org/abs/1234.5678v1"/>
+    <arxiv:primary_category term="cs.CL"/>
+    <category term="cs.CL"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2345.6789v1</id>
+    <updated>2025-12-15T12:00:00Z</updated>
+    <published>2025-12-15T12:00:00Z</published>
+    <title>Second Paper &amp; Testing</title>
+    <summary>Abstract with <b>HTML</b> tags &amp; punctuation! Mentions CIFAR and F1 score.</summary>
+    <author><name>Carol Lee</name></author>
+    <link rel="alternate" href="http://arxiv.org/abs/2345.6789v1"/>
+    <arxiv:primary_category term="cs.LG"/>
+    <category term="cs.LG"/>
+  </entry>
+</feed>
