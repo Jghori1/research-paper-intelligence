@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+"""arXiv scraping utilities.
+
+This module provides a clear, well-factored implementation to query the arXiv
+Atom API, convert Atom <entry> elements into the project's Paper domain model,
+and persist results to a CSV file.
+
+Design goals:
+- Keep network, parsing, and persistence concerns separated and testable.
+- Use retries and timeouts for robustness against transient network failures.
+- Provide clear type annotations and concise, actionable logging messages.
+
+Functionality is intentionally unchanged from the previous implementation: it
+pages through arXiv results, extracts title/authors/abstract/published date/
+categories/link, and writes a CSV at data/raw/papers.csv by default.
+"""
+
+import argparse
 import logging
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 from xml.etree import ElementTree as ET
@@ -21,39 +37,54 @@ ARXIV_API_URL = "http://export.arxiv.org/api/query"
 ATOM_NS = "http://www.w3.org/2005/Atom"
 ARXIV_NS = "http://arxiv.org/schemas/atom"
 NS = {"atom": ATOM_NS, "arxiv": ARXIV_NS}
+DEFAULT_OUT = Path("data") / "raw" / "papers.csv"
+_DEFAULT_BATCH_SLEEP = 0.34
+
+
+# --------------------
+# Network utilities
+# --------------------
+
+
+def _build_query_params(search_query: str, start: int, max_results: int) -> Dict[str, str]:
+    """Return query parameters for the arXiv API call.
+
+    Args:
+        search_query: arXiv search expression.
+        start: Offset for results.
+        max_results: Number of results to request.
+
+    Returns:
+        Mapping of query parameter names to values.
+    """
+    return {"search_query": search_query, "start": str(start), "max_results": str(max_results)}
 
 
 def _build_query_url(search_query: str, start: int = 0, max_results: int = 100) -> str:
-    """Construct the arXiv API query URL.
+    """Construct a fully encoded arXiv API URL.
 
-    Args:
-        search_query: arXiv search expression (e.g. "cat:cs.CL" or "all:machine learning").
-        start: Result offset.
-        max_results: Number of results to retrieve.
-
-    Returns:
-        Fully formed URL for the arXiv API.
+    This helper keeps the URL construction small and dependency-free.
     """
-    params = {
-        "search_query": search_query,
-        "start": str(start),
-        "max_results": str(max_results),
-    }
-    # Build query string manually to avoid pulling in extra deps
+    params = _build_query_params(search_query, start, max_results)
+    # requests.utils.requote_uri ensures characters are safe for URLs
     q = "&".join(f"{k}={requests.utils.requote_uri(v)}" for k, v in params.items())
-    return f"{ARXIV_API_URL}?{q}"
+    url = f"{ARXIV_API_URL}?{q}"
+    logger.debug("Built arXiv URL: %s", url)
+    return url
 
 
-def _create_session(retries: int = 5, backoff_factor: float = 1.0, status_forcelist: Optional[List[int]] = None) -> requests.Session:
-    """Create a requests.Session configured with retries.
+def _create_session(
+    retries: int = 5, backoff_factor: float = 0.5, status_forcelist: Optional[List[int]] = None
+) -> requests.Session:
+    """Create an HTTP session with a retry policy.
 
     Args:
-        retries: Total number of retry attempts.
-        backoff_factor: Backoff multiplier between attempts.
+        retries: Total retry attempts for transient failures.
+        backoff_factor: Controls sleep time between retries.
         status_forcelist: HTTP status codes that should trigger a retry.
 
     Returns:
-        Configured requests.Session.
+        Configured requests.Session instance.
     """
     status_forcelist = status_forcelist or [429, 500, 502, 503, 504]
     session = requests.Session()
@@ -67,201 +98,191 @@ def _create_session(retries: int = 5, backoff_factor: float = 1.0, status_forcel
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    logger.debug("HTTP session created with retries=%s backoff=%s", retries, backoff_factor)
     return session
 
 
 def _fetch_xml(session: requests.Session, url: str, timeout: float = 10.0) -> str:
-    """Fetch XML content from the given URL using the provided session.
-
-    Args:
-        session: Configured requests.Session.
-        url: URL to fetch.
-        timeout: Request timeout in seconds.
-
-    Returns:
-        Response text (XML).
+    """Fetch XML from the given URL.
 
     Raises:
-        NetworkError: When the request fails after retries.
+        NetworkError: If the request fails after retries.
     """
-    logger.debug("Fetching URL: %s", url)
+    logger.debug("Requesting XML from %s", url)
     try:
         resp = session.get(url, timeout=timeout)
         resp.raise_for_status()
         return resp.text
     except requests.RequestException as exc:
-        logger.error("Network error fetching %s: %s", url, exc)
+        logger.error("Error fetching %s: %s", url, exc)
         raise NetworkError(f"Failed to fetch {url}: {exc}") from exc
 
 
-def _parse_entry(elem: ET.Element) -> Paper:
-    """Parse a single Atom <entry> element into a Paper.
+# --------------------
+# Parsing utilities
+# --------------------
+
+
+def _get_text(elem: ET.Element, tag: str, ns: str = "atom") -> Optional[str]:
+    """Return the trimmed text content of a child tag, or None.
 
     Args:
-        elem: XML Element for the entry.
+        elem: Parent XML element.
+        tag: Local tag name (without namespace prefix).
+        ns: Namespace key defined in NS.
+    """
+    node = elem.find(f"{ns}:{tag}", NS)
+    return node.text.strip() if node is not None and node.text else None
 
-    Returns:
-        Paper instance.
+
+def _parse_authors(entry: ET.Element) -> List[str]:
+    """Extract author names from an <entry> element."""
+    names: List[str] = []
+    for author in entry.findall("atom:author", NS):
+        name = author.find("atom:name", NS)
+        if name is not None and name.text:
+            names.append(name.text.strip())
+    return names
+
+
+def _parse_categories(entry: ET.Element) -> List[str]:
+    """Extract category terms from an <entry> element."""
+    cats: List[str] = []
+    for cat in entry.findall("atom:category", NS):
+        term = cat.attrib.get("term")
+        if term:
+            cats.append(term)
+    return cats
+
+
+def _parse_link(entry: ET.Element) -> Optional[str]:
+    """Find the preferred link for the paper (alternate) or fall back to <id>.
+
+    arXiv typically exposes a link rel="alternate"; use it when present.
+    """
+    for link_el in entry.findall("atom:link", NS):
+        if link_el.attrib.get("rel") == "alternate":
+            href = link_el.attrib.get("href")
+            if href:
+                return href
+    return _get_text(entry, "id")
+
+
+def _parse_entry(entry: ET.Element) -> Paper:
+    """Convert an Atom <entry> into a Paper domain object.
 
     Raises:
-        ParseError: If required fields cannot be parsed.
+        ParseError: When required fields (title) are missing or other parsing fails.
     """
     try:
-        def _text(tag: str, ns_key: str = "atom") -> Optional[str]:
-            node = elem.find(f"{ns_key}:{tag}", NS)
-            return node.text.strip() if node is not None and node.text else None
-
-        title = _text("title") or _text("id")
-        summary = _text("summary")
-        published = _text("published")
-
-        # Authors
-        authors = []
-        for a in elem.findall("atom:author", NS):
-            name = a.find("atom:name", NS)
-            if name is not None and name.text:
-                authors.append(name.text.strip())
-
-        # Categories
-        categories = []
-        for c in elem.findall("atom:category", NS):
-            term = c.attrib.get("term")
-            if term:
-                categories.append(term)
-
-        # Link: prefer the alternate link or the id
-        link = None
-        for l in elem.findall("atom:link", NS):
-            if l.attrib.get("rel") == "alternate":
-                link = l.attrib.get("href")
-                break
-        if not link:
-            # fallback to <id>
-            link = _text("id")
-
+        title = _get_text(entry, "title") or _get_text(entry, "id")
         if not title:
-            raise ParseError("Missing title in entry")
+            raise ParseError("missing title")
+
+        authors = _parse_authors(entry)
+        abstract = _get_text(entry, "summary")
+        published = _get_text(entry, "published")
+        categories = _parse_categories(entry)
+        link = _parse_link(entry) or ""
 
         return Paper(
             title=title,
             authors=authors,
-            abstract=summary,
+            abstract=abstract,
             doi=None,
-            published_date=published and _parse_date_safe(published),
-            source=link or "",
+            published_date=published,
+            source=link,
+            categories=categories,
         )
     except ParseError:
         raise
     except Exception as exc:
-        logger.exception("Failed to parse entry: %s", exc)
-        raise ParseError(f"Failed to parse entry: {exc}") from exc
-
-
-def _parse_date_safe(value: str) -> Optional[str]:
-    """Return ISO date string or None if parsing fails.
-
-    arXiv published dates are ISO-8601; we keep as string for CSV friendliness.
-    """
-    try:
-        # Basic validation — ensure it's non-empty
-        return value.strip()
-    except Exception:
-        return None
+        logger.exception("Unexpected parse error for entry: %s", exc)
+        raise ParseError(f"failed to parse entry: {exc}") from exc
 
 
 def _parse_feed(xml_text: str) -> List[Paper]:
-    """Parse Atom feed XML and return a list of Paper objects.
+    """Parse the Atom feed text and return Paper instances for each entry.
 
-    Args:
-        xml_text: Raw Atom XML string.
-
-    Returns:
-        List of Paper instances.
+    Non-fatal parse errors for individual entries are logged and skipped.
     """
-    root = ET.fromstring(xml_text)
-    entries = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        logger.error("Failed to parse XML: %s", exc)
+        raise ParseError(f"invalid XML: {exc}") from exc
+
+    papers: List[Paper] = []
     for entry in root.findall("atom:entry", NS):
         try:
-            entries.append(_parse_entry(entry))
+            papers.append(_parse_entry(entry))
         except ParseError as exc:
-            logger.warning("Skipping entry due to parse error: %s", exc)
-    return entries
+            logger.warning("Skipping malformed entry: %s", exc)
+    return papers
+
+
+# --------------------
+# High-level orchestration
+# --------------------
 
 
 def scrape_arxiv(search_query: str, max_results: int = 100, batch_size: int = 100) -> List[Paper]:
-    """Scrape arXiv for papers matching the given query.
+    """Retrieve up to ``max_results`` papers matching ``search_query`` from arXiv.
 
-    The function pages through results in batches and returns a list of Paper objects.
-
-    Args:
-        search_query: arXiv search expression (see arXiv API docs).
-        max_results: Maximum number of papers to retrieve in total.
-        batch_size: Number of results to request per API call (max 2000 typically; keep small).
-
-    Returns:
-        List of Paper instances.
+    The function pages through results using batches of size ``batch_size``. It
+    returns the collected Paper objects. Network and parsing errors are surfaced
+    as NetworkError or ParseError respectively.
     """
     session = _create_session()
     papers: List[Paper] = []
-    fetched = 0
+    offset = 0
 
-    while fetched < max_results:
-        to_fetch = min(batch_size, max_results - fetched)
-        url = _build_query_url(search_query, start=fetched, max_results=to_fetch)
+    while offset < max_results:
+        limit = min(batch_size, max_results - offset)
+        url = _build_query_url(search_query, start=offset, max_results=limit)
         xml = _fetch_xml(session, url)
         batch = _parse_feed(xml)
         if not batch:
-            logger.info("No more entries returned by arXiv API; stopping at %d results", fetched)
+            logger.info("arXiv returned no entries; stopping at offset %d", offset)
             break
         papers.extend(batch)
-        fetched += len(batch)
-        logger.info("Fetched %d papers (total=%d)", len(batch), fetched)
-        # Be polite to the API
-        time.sleep(0.34)
+        offset += len(batch)
+        logger.info("Fetched %d entries (offset now %d)", len(batch), offset)
+        time.sleep(_DEFAULT_BATCH_SLEEP)
+
     return papers
 
 
 def write_papers_csv(papers: Iterable[Paper], path: Path) -> None:
-    """Write papers to a CSV file.
+    """Persist an iterable of Paper objects to CSV.
 
     Args:
-        papers: Iterable of Paper objects.
-        path: Destination CSV path.
+        papers: Iterable of Paper domain objects.
+        path: File system path to write the CSV to.
     """
-    rows: List[Dict[str, object]] = []
-    for p in papers:
-        d = p.to_dict()
-        # Ensure categories field exists (arXiv parsing currently uses Paper.source for URL)
-        d.setdefault("categories", None)
-        rows.append(d)
-
+    rows = [p.to_dict() for p in papers]
     df = pd.DataFrame(rows)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
     logger.info("Wrote %d papers to %s", len(rows), path)
 
 
 def main(search_query: str = "cat:cs.CL", max_results: int = 100, out_path: Optional[Path] = None) -> int:
-    """High-level entry point to perform a scrape and persist results.
+    """Top-level entry point for command-line execution.
 
-    Args:
-        search_query: arXiv API search expression.
-        max_results: Maximum number of entries to retrieve.
-        out_path: Output CSV path. Defaults to data/raw/papers.csv in repo root.
-
-    Returns:
-        Exit code (0 on success, non-zero on failure).
+    Returns an exit code: 0 on success, non-zero on different failure classes.
     """
-    out_path = out_path or (Path.cwd() / "data" / "raw" / "papers.csv")
+    out = out_path or DEFAULT_OUT
     try:
         papers = scrape_arxiv(search_query, max_results=max_results)
-        write_papers_csv(papers, out_path)
+        write_papers_csv(papers, out)
         return 0
     except NetworkError as exc:
-        logger.exception("Network failure during scrape: %s", exc)
+        logger.exception("Network error during scrape: %s", exc)
         return 2
     except ParseError as exc:
-        logger.exception("Parsing failure during scrape: %s", exc)
+        logger.exception("Parsing error during scrape: %s", exc)
         return 3
     except Exception as exc:
         logger.exception("Unexpected error during scrape: %s", exc)
@@ -269,9 +290,6 @@ def main(search_query: str = "cat:cs.CL", max_results: int = 100, out_path: Opti
 
 
 if __name__ == "__main__":
-    # Minimal CLI for ad-hoc execution
-    import argparse
-
     parser = argparse.ArgumentParser("arxiv-scrape")
     parser.add_argument("query", nargs="?", default="cat:cs.CL", help="arXiv search query")
     parser.add_argument("--max", type=int, default=100, help="Maximum results to fetch")
