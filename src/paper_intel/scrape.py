@@ -295,5 +295,8 @@ if __name__ == "__main__":
     parser.add_argument("--max", type=int, default=100, help="Maximum results to fetch")
     parser.add_argument("--out", type=str, default=None, help="Output CSV path")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
+    from .utils import configure_logger
+
+    # Configure application-wide logging: console + file
+    configure_logger(level=logging.INFO, log_file=Path("logs") / "project.log")
     raise SystemExit(main(args.query, args.max, Path(args.out) if args.out else None))
